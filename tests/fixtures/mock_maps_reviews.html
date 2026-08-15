@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<!--
+  Offline stand-in for the Google Maps review pane. Mirrors the class names,
+  aria-labels and nesting the real page uses (as of the selectors in
+  scrape_pizzaville_reviews.py) so the extraction JS can be tested without
+  hitting Google.
+-->
+<html lang="en">
+<head><meta charset="utf-8"><title>Mock Maps reviews</title>
+<style>
+  #pane { height: 300px; overflow-y: auto; }
+  .jftiEf { min-height: 200px; }
+</style>
+</head>
+<body>
+  <h1 class="DUwDvf">Pizzaville</h1>
+  <div class="F7nice">
+    <span aria-hidden="true">4.1</span>
+    <span aria-label="382 reviews"><span>(382)</span></span>
+  </div>
+  <button jsaction="pane.rating.category">Pizza restaurant</button>
+  <button data-item-id="address" aria-label="Address: 60 Atlantic Ave, Toronto, ON M6K 1X9">60 Atlantic Ave</button>
+  <button data-item-id="phone:tel:4165551234" aria-label="Phone: (416) 555-1234">(416) 555-1234</button>
+  <a data-item-id="authority" href="https://www.pizzaville.ca/">pizzaville.ca</a>
+
+  <div id="pane">
+    <!-- Standard review: rating, text, owner response, photos, likes -->
+    <div class="jftiEf fontBodyMedium" data-review-id="ChZDSUhNMG9nS0VJQ0FnSUMxAbCdEAE" jsaction="mouseover:pane.review">
+      <div class="jJc9Ad">
+        <div class="GHT2ce">
+          <div class="WNxzHc">
+            <button jsaction="review.reviewerLink" aria-label="Photo of Dana Whitfield"></button>
+            <div class="d4r55">Dana Whitfield</div>
+            <div class="RfnDt">Local Guide · 214 reviews · 1,032 photos</div>
+          </div>
+        </div>
+        <div class="DU9Pgb">
+          <span class="kvMYJc" role="img" aria-label="5 stars"></span>
+          <span class="rsqaWe">3 months ago</span>
+        </div>
+        <div class="MyEned">
+          <span class="wiI7pd">Best pizza in Liberty Village, hands down. The crust is perfect and delivery was quick.</span>
+          <button class="w8nwRe" aria-label="See more">More</button>
+        </div>
+        <button data-photo-index="0"></button>
+        <button data-photo-index="1"></button>
+        <button jsaction="pane.review.thumbUp" aria-label="12 people found this helpful"><span class="pkWtMe">12</span></button>
+        <div class="CDe7pd">
+          <div class="DZSIDd"><span class="DZSIDd">2 months ago</span></div>
+          <div class="wiI7pd">Thanks so much for the kind words, Dana! See you next time.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Rating only, no text, no owner reply -->
+    <div class="jftiEf fontBodyMedium" data-review-id="ChdDSUhNMG9nS0VJQ0FnSUMxbrandNEW" jsaction="mouseover:pane.review">
+      <div class="jJc9Ad">
+        <a href="https://www.google.com/maps/contrib/109876543210/reviews" class="WEBjve">
+          <div class="d4r55">M. Okonkwo</div>
+        </a>
+        <div class="RfnDt">3 reviews</div>
+        <span class="kvMYJc" role="img" aria-label="2 stars"></span>
+        <span class="rsqaWe">a week ago</span>
+      </div>
+    </div>
+
+    <!-- Imported/third-party style rating ("4/5") plus decimal star label -->
+    <div class="jftiEf fontBodyMedium" data-review-id="ChZDSUhNMG9nS0VJQ0FnSUMxaW1wb3J0" jsaction="mouseover:pane.review">
+      <div class="jJc9Ad">
+        <div class="d4r55">Priya Raman</div>
+        <span class="fzvQIb">4/5</span>
+        <span class="rsqaWe">2 years ago</span>
+        <div class="MyEned"><span class="wiI7pd">Solid slices, tight seating. Good for takeout.</span></div>
+      </div>
+    </div>
+
+    <!-- Duplicate of the first review id: must be de-duplicated -->
+    <div class="jftiEf fontBodyMedium" data-review-id="ChZDSUhNMG9nS0VJQ0FnSUMxAbCdEAE" jsaction="mouseover:pane.review">
+      <div class="jJc9Ad">
+        <div class="d4r55">Dana Whitfield</div>
+        <span class="kvMYJc" role="img" aria-label="5 stars"></span>
+        <span class="rsqaWe">3 months ago</span>
+        <div class="MyEned"><span class="wiI7pd">Best pizza in Liberty Village, hands down. The crust is perfect and delivery was quick.</span></div>
+      </div>
+    </div>
+
+    <!-- Chrome that carries data-review-id but is not a review: must be skipped -->
+    <div data-review-id="summary-block" jsaction="pane.reviewSummary">
+      <div class="fontTitleSmall">Review summary</div>
+    </div>
+  </div>
+</body>
+</html>
