@@ -2,7 +2,7 @@
 <!--
   Offline stand-in for the Google Maps review pane. Mirrors the class names,
   aria-labels and nesting the real page uses (as of the selectors in
-  scrape_pizzaville_reviews.py) so the extraction JS can be tested without
+  scrape_google_reviews.py) so the extraction JS can be tested without
   hitting Google.
 -->
 <html lang="en">
@@ -13,7 +13,7 @@
 </style>
 </head>
 <body>
-  <h1 class="DUwDvf">Pizzaville</h1>
+  <h1 class="DUwDvf">Sample Pizza Co</h1>
   <div class="F7nice">
     <span aria-hidden="true">4.1</span>
     <span aria-label="382 reviews"><span>(382)</span></span>
@@ -21,7 +21,7 @@
   <button jsaction="pane.rating.category">Pizza restaurant</button>
   <button data-item-id="address" aria-label="Address: 60 Atlantic Ave, Toronto, ON M6K 1X9">60 Atlantic Ave</button>
   <button data-item-id="phone:tel:4165551234" aria-label="Phone: (416) 555-1234">(416) 555-1234</button>
-  <a data-item-id="authority" href="https://www.pizzaville.ca/">pizzaville.ca</a>
+  <a data-item-id="authority" href="https://www.example-pizza.test/">example-pizza.test</a>
 
   <div id="pane">
     <!-- Standard review: rating, text, owner response, photos, likes -->
@@ -39,7 +39,7 @@
           <span class="rsqaWe">3 months ago</span>
         </div>
         <div class="MyEned">
-          <span class="wiI7pd">Best pizza in Liberty Village, hands down. The crust is perfect and delivery was quick.</span>
+          <span class="wiI7pd">Best pizza in the neighbourhood, hands down. The crust is perfect and delivery was quick.</span>
           <button class="w8nwRe" aria-label="See more">More</button>
         </div>
         <button data-photo-index="0"></button>
@@ -80,7 +80,7 @@
         <div class="d4r55">Dana Whitfield</div>
         <span class="kvMYJc" role="img" aria-label="5 stars"></span>
         <span class="rsqaWe">3 months ago</span>
-        <div class="MyEned"><span class="wiI7pd">Best pizza in Liberty Village, hands down. The crust is perfect and delivery was quick.</span></div>
+        <div class="MyEned"><span class="wiI7pd">Best pizza in the neighbourhood, hands down. The crust is perfect and delivery was quick.</span></div>
       </div>
     </div>
 

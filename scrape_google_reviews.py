@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Scrape Google reviews for Pizzaville (Liberty Village, Toronto).
+"""Scrape Google reviews for any restaurant, pinned by Google Place ID.
+
+Targets are named in ``places.json``, a hand-maintained registry mapping a short
+slug to a Place ID plus the name and address that ID is expected to resolve to::
+
+    {
+      "pizzaville-liberty-village": {
+        "place_id": "ChIJ...",
+        "name": "Pizzaville",
+        "address": "60 Atlantic Ave, Toronto, ON M6K 1X9"
+      }
+    }
+
+Then scrape by slug. The name/address in the record are not decoration: every
+run checks the resolved place against them and aborts on a mismatch, so a stale
+or rebranded listing fails loudly instead of quietly polluting your dataset.
 
 Two backends are available:
 
@@ -12,18 +27,23 @@ Two backends are available:
 
 Examples
 --------
-    # Everything Google Maps will hand out, newest first, as JSON + CSV
-    python scrape_pizzaville_reviews.py --sort newest --output reviews.json --csv reviews.csv
+    # Find a place and print a pasteable registry record
+    python scrape_google_reviews.py --find "Pizzaville Liberty Village Toronto"
 
-    # Watch it work
-    python scrape_pizzaville_reviews.py --no-headless --max-reviews 50
+    # Scrape a registered slug (the normal case)
+    python scrape_google_reviews.py pizzaville-liberty-village --csv reviews.csv
 
-    # A different restaurant / a known Maps URL
-    python scrape_pizzaville_reviews.py --query "Pizzaville Etobicoke"
-    python scrape_pizzaville_reviews.py --url "https://www.google.com/maps/place/..."
+    # Ad-hoc targets: a raw Place ID, a Maps URL, or a fuzzy text search
+    python scrape_google_reviews.py ChIJ0SPBaLM0K4gRuFqEbODjSDs
+    python scrape_google_reviews.py "https://www.google.com/maps/place/..."
+    python scrape_google_reviews.py "Pizzaville Etobicoke"     # fuzzy, warns
+
+    # Re-check every registry entry for drift
+    python scrape_google_reviews.py --verify-registry
 
     # Official API
-    python scrape_pizzaville_reviews.py --backend places-api --api-key "$GOOGLE_MAPS_API_KEY"
+    python scrape_google_reviews.py pizzaville-liberty-village \
+        --backend places-api --api-key "$GOOGLE_MAPS_API_KEY"
 
 Note: scraping Google Maps is against Google's Terms of Service, and the page
 markup changes without warning. The selectors below are defensive (several
@@ -41,11 +61,19 @@ import random
 import re
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
 from typing import Any, Iterable
 
-DEFAULT_QUERY = "Pizzaville Liberty Village Toronto"
+DEFAULT_REGISTRY = "places.json"
+
+# Google's canonical place identifier, e.g. ChIJ0SPBaLM0K4gRuFqEbODjSDs.
+PLACE_ID_RE = re.compile(r"^ChI[Ja-zA-Z0-9_-]{10,}$")
+# The older feature id ("ftid") pair still embedded in Maps URLs.
+FTID_RE = re.compile(r"^0x[0-9a-f]+:0x[0-9a-f]+$", re.IGNORECASE)
+# Used to pull a place id out of a rendered Maps page.
+PLACE_ID_IN_PAGE_RE = re.compile(r"\"(ChI[Ja-zA-Z0-9_-]{20,})\"")
 
 SORT_OPTIONS = {
     "relevant": 0,
@@ -85,7 +113,37 @@ class Place:
     phone: str = ""
     website: str = ""
     url: str = ""
+    place_id: str = ""
+    slug: str = ""
+    business_status: str = "OPERATIONAL"
+    verified: bool = False       # did the resolved place match its registry record?
     reviews: list[Review] = field(default_factory=list)
+
+
+@dataclass
+class Target:
+    """A resolved scrape target and, when registered, what it should look like."""
+
+    raw: str = ""
+    kind: str = "query"          # registry | place_id | url | query
+    slug: str = ""
+    place_id: str = ""
+    url: str = ""
+    query: str = ""
+    expected_name: str = ""
+    expected_address: str = ""
+
+    @property
+    def is_registered(self) -> bool:
+        return self.kind == "registry"
+
+    @property
+    def is_precise(self) -> bool:
+        """True when the target names one specific place rather than a search."""
+        return self.kind in ("registry", "place_id", "url")
+
+    def label(self) -> str:
+        return self.slug or self.expected_name or self.place_id or self.query or self.raw
 
 
 # --------------------------------------------------------------------------- #
@@ -151,6 +209,149 @@ def parse_int(text: str) -> int:
         return 0
     digits = re.sub(r"[^\d]", "", text)
     return int(digits) if digits else 0
+
+
+def slugify(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return slug or "place"
+
+
+def street_number(address: str) -> str:
+    """Leading street number of an address, used as a cheap identity check."""
+    match = re.search(r"\b(\d+[A-Za-z]?)\b", address or "")
+    return match.group(1).lower() if match else ""
+
+
+# --------------------------------------------------------------------------- #
+# Registry
+# --------------------------------------------------------------------------- #
+def load_registry(path: str = DEFAULT_REGISTRY) -> dict[str, dict]:
+    """Load places.json. A missing file is fine -- ad-hoc targets still work."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{path} is not valid JSON: {exc}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"{path} must be a JSON object mapping slug -> record")
+
+    for slug, record in data.items():
+        if not isinstance(record, dict) or not record.get("place_id"):
+            raise SystemExit(f"{path}: entry {slug!r} is missing a 'place_id'")
+    return data
+
+
+def place_id_url(place_id: str) -> str:
+    """Documented URL form for opening a place by id -- no API key required."""
+    from urllib.parse import quote
+
+    if FTID_RE.match(place_id):
+        return f"https://www.google.com/maps/place/?ftid={quote(place_id)}&hl=en"
+    return f"https://www.google.com/maps/place/?q=place_id:{quote(place_id)}&hl=en"
+
+
+def search_url(query: str, near: str | None = None, zoom: int = 14) -> str:
+    """Maps search URL, optionally biased to a 'lat,lng' centre."""
+    from urllib.parse import quote_plus
+
+    url = f"https://www.google.com/maps/search/{quote_plus(query)}"
+    if near:
+        url += f"/@{near.strip()},{zoom}z"
+    return url + "?hl=en&gl=ca"
+
+
+def resolve_target(
+    raw: str,
+    registry: dict[str, dict] | None = None,
+    near: str | None = None,
+) -> Target:
+    """Work out what the user meant by their positional argument.
+
+    Precedence: registry slug > raw Place ID / FTID > Maps URL > text query.
+    """
+    registry = registry or {}
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("No target given")
+
+    record = registry.get(text)
+    if record:
+        place_id = record["place_id"]
+        return Target(
+            raw=text,
+            kind="registry",
+            slug=text,
+            place_id=place_id,
+            url=place_id_url(place_id),
+            expected_name=record.get("name", ""),
+            expected_address=record.get("address", ""),
+        )
+
+    if PLACE_ID_RE.match(text) or FTID_RE.match(text):
+        return Target(
+            raw=text,
+            kind="place_id",
+            slug=slugify(text[:24]),
+            place_id=text,
+            url=place_id_url(text),
+        )
+
+    if text.startswith("http://") or text.startswith("https://"):
+        return Target(raw=text, kind="url", slug="", url=text)
+
+    return Target(
+        raw=text,
+        kind="query",
+        slug=slugify(text),
+        query=text,
+        url=search_url(text, near=near),
+    )
+
+
+def verify_place(place: Place, target: Target, strict: bool = True) -> list[str]:
+    """Check a resolved place against its registry record.
+
+    Returns a list of problems. Raises when ``strict`` and anything mismatched --
+    a wrong or rebranded listing must not slip silently into the dataset.
+    """
+    problems: list[str] = []
+
+    if place.business_status and place.business_status != "OPERATIONAL":
+        problems.append(
+            f"listing is {place.business_status.replace('_', ' ').lower()}; "
+            "its reviews describe a business that is no longer trading"
+        )
+
+    if target.is_registered:
+        expected_name = target.expected_name.strip().lower()
+        actual_name = place.name.strip().lower()
+        if expected_name and expected_name not in actual_name and actual_name not in expected_name:
+            problems.append(
+                f"name mismatch: registry says {target.expected_name!r}, "
+                f"Google returned {place.name!r} -- the listing may have been "
+                "rebranded, which means its reviews now mix two businesses"
+            )
+
+        expected_number = street_number(target.expected_address)
+        actual_number = street_number(place.address)
+        if expected_number and actual_number and expected_number != actual_number:
+            problems.append(
+                f"address mismatch: registry says {target.expected_address!r}, "
+                f"Google returned {place.address!r}"
+            )
+
+    place.verified = target.is_registered and not problems
+
+    if problems and strict:
+        detail = "\n  - ".join(problems)
+        raise RuntimeError(
+            f"Refusing to scrape {target.label()!r}:\n  - {detail}\n"
+            f"Re-pin it with:  --find {target.expected_name or target.label()!r}\n"
+            "Or pass --no-verify to scrape anyway."
+        )
+    return problems
 
 
 # --------------------------------------------------------------------------- #
@@ -288,6 +489,18 @@ JS_PLACE_DETAILS = r"""
     const el = document.querySelector(sel);
     return el ? (el.getAttribute(name) || '') : '';
   };
+  // "Permanently closed" / "Temporarily closed" banner. Matched on exact text
+  // outside any review node so a review mentioning closure cannot trigger it.
+  let status = 'OPERATIONAL';
+  for (const el of document.querySelectorAll('span, div')) {
+    const label = el.textContent.trim();
+    if (label !== 'Permanently closed' && label !== 'Temporarily closed') continue;
+    if (el.closest('[data-review-id]')) continue;
+    if (el.children.length) continue;
+    status = label === 'Permanently closed' ? 'CLOSED_PERMANENTLY' : 'CLOSED_TEMPORARILY';
+    break;
+  }
+
   return {
     name: text('h1.DUwDvf') || text('h1'),
     rating: text('div.F7nice span[aria-hidden="true"]')
@@ -298,7 +511,35 @@ JS_PLACE_DETAILS = r"""
     address: attr('button[data-item-id="address"]', 'aria-label'),
     phone: attr('button[data-item-id^="phone"]', 'aria-label'),
     website: attr('a[data-item-id="authority"]', 'href'),
+    business_status: status,
   };
+}
+"""
+
+# Search-results list, used by --find to build registry records.
+JS_SEARCH_RESULTS = r"""
+() => {
+  const out = [];
+  const links = document.querySelectorAll('div[role="feed"] a[href*="/maps/place/"]');
+  for (const link of links) {
+    const card = link.closest('div[jsaction]') || link.parentElement;
+    const name = link.getAttribute('aria-label')
+      || (card ? (card.querySelector('div.qBF1Pd, div.fontHeadlineSmall') || {}).textContent : '')
+      || '';
+    const lines = card
+      ? Array.from(card.querySelectorAll('div.W4Efsd span, div.UaQhfb span'))
+          .map((s) => s.textContent.trim())
+          .filter(Boolean)
+      : [];
+    out.push({
+      name: name.trim(),
+      url: link.href,
+      rating: card ? ((card.querySelector('span.MW4etd') || {}).textContent || '') : '',
+      review_count: card ? ((card.querySelector('span.UY7F9') || {}).textContent || '') : '',
+      detail_lines: lines,
+    });
+  }
+  return out;
 }
 """
 
@@ -332,8 +573,10 @@ class GoogleMapsReviewScraper:
         if self.verbose:
             print(f"[scraper] {message}", file=sys.stderr, flush=True)
 
-    # -- public ----------------------------------------------------------- #
-    def scrape(self, query: str | None = None, url: str | None = None) -> Place:
+    # -- browser ---------------------------------------------------------- #
+    @contextmanager
+    def _page(self):
+        """Launch Chromium and yield a configured page."""
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:  # pragma: no cover
@@ -368,35 +611,126 @@ class GoogleMapsReviewScraper:
             )
             page = context.new_page()
             page.set_default_timeout(self.timeout)
-
             try:
-                target = url or self._search_url(query or DEFAULT_QUERY)
-                self.log(f"opening {target}")
-                page.goto(target, wait_until="domcontentloaded")
-                self._dismiss_consent(page)
-                self._ensure_place_page(page)
-
-                place = self._read_place_details(page)
-                place.url = page.url
-
-                self._open_reviews(page)
-                self._set_sort(page, self.sort)
-                self._load_all_reviews(page)
-                self._expand_long_reviews(page)
-
-                place.reviews = self._extract_reviews(page, place.url)
-                self.log(f"collected {len(place.reviews)} reviews")
-                return place
+                yield page
             finally:
                 context.close()
                 browser.close()
 
-    # -- steps ------------------------------------------------------------ #
-    @staticmethod
-    def _search_url(query: str) -> str:
-        from urllib.parse import quote_plus
+    # -- public ----------------------------------------------------------- #
+    def scrape(self, target: Target, strict_verify: bool = True) -> Place:
+        with self._page() as page:
+            self.log(f"target: {target.label()} (resolved as {target.kind})")
+            self._goto_place(page, target)
 
-        return f"https://www.google.com/maps/search/{quote_plus(query)}?hl=en&gl=ca"
+            place = self._read_place_details(page)
+            place.url = page.url
+            place.place_id = target.place_id or self._read_place_id(page)
+            place.slug = target.slug or slugify(place.name)
+
+            for problem in verify_place(place, target, strict=strict_verify):
+                self.log(f"WARNING: {problem}")
+
+            self._open_reviews(page)
+            self._set_sort(page, self.sort)
+            self._load_all_reviews(page)
+            self._expand_long_reviews(page)
+
+            place.reviews = self._extract_reviews(page, place.url)
+            self.log(f"collected {len(place.reviews)} reviews")
+            return place
+
+    def find(self, query: str, limit: int = 5, near: str | None = None) -> list[dict]:
+        """Search Maps and return candidate places with their Place IDs."""
+        with self._page() as page:
+            page.goto(search_url(query, near=near), wait_until="domcontentloaded")
+            self._dismiss_consent(page)
+
+            # A precise query can skip the list and land straight on a place.
+            if page.locator("h1.DUwDvf").count() > 0 and not page.locator(
+                'div[role="feed"] a[href*="/maps/place/"]'
+            ).count():
+                place = self._read_place_details(page)
+                return [{
+                    "name": place.name,
+                    "address": place.address,
+                    "rating": place.rating,
+                    "review_count": place.review_count,
+                    "place_id": self._read_place_id(page),
+                    "url": page.url,
+                }]
+
+            try:
+                page.wait_for_selector('div[role="feed"] a[href*="/maps/place/"]', timeout=15_000)
+            except Exception:
+                return []
+
+            results = page.evaluate(JS_SEARCH_RESULTS)[:limit]
+            self.log(f"{len(results)} candidate(s); opening each to read its place id")
+
+            candidates: list[dict] = []
+            for result in results:
+                entry = {
+                    "name": result.get("name", ""),
+                    "address": " · ".join(result.get("detail_lines", [])[:2]),
+                    "rating": parse_rating(result.get("rating", "")),
+                    "review_count": parse_int(result.get("review_count", "")),
+                    "place_id": "",
+                    "url": result.get("url", ""),
+                }
+                try:
+                    page.goto(entry["url"], wait_until="domcontentloaded")
+                    page.wait_for_selector("h1.DUwDvf", timeout=10_000)
+                    details = page.evaluate(JS_PLACE_DETAILS)
+                    entry["name"] = details.get("name") or entry["name"]
+                    entry["address"] = (
+                        re.sub(r"^Address:\s*", "", details.get("address", "")).strip()
+                        or entry["address"]
+                    )
+                    entry["place_id"] = self._read_place_id(page)
+                    entry["url"] = page.url
+                except Exception as exc:
+                    self.log(f"could not open {entry['name']!r}: {exc}")
+                candidates.append(entry)
+            return candidates
+
+    # -- steps ------------------------------------------------------------ #
+    def _read_place_id(self, page: Any) -> str:
+        """Best-effort Place ID from the rendered page.
+
+        Maps embeds the id in the page payload rather than exposing it in the
+        DOM, so this is a regex over the HTML with an ftid fallback from the URL.
+        """
+        try:
+            match = PLACE_ID_IN_PAGE_RE.search(page.content())
+            if match:
+                return match.group(1)
+        except Exception:
+            pass
+        ftid = re.search(r"[?&]ftid=([^&]+)", page.url)
+        if ftid:
+            return ftid.group(1)
+        hexid = re.search(r"!1s(0x[0-9a-f]+:0x[0-9a-f]+)", page.url)
+        return hexid.group(1) if hexid else ""
+
+    def _goto_place(self, page: Any, target: Target) -> None:
+        self.log(f"opening {target.url}")
+        page.goto(target.url, wait_until="domcontentloaded")
+        self._dismiss_consent(page)
+
+        if target.is_precise:
+            # A Place ID / place URL resolves straight to the place pane.
+            try:
+                page.wait_for_selector("h1.DUwDvf", timeout=20_000)
+                return
+            except Exception:
+                pass
+            if page.locator('div[role="feed"] a[href*="/maps/place/"]').count() == 0:
+                raise RuntimeError(
+                    f"{target.place_id or target.url} did not resolve to a place. "
+                    "The Place ID may be retired -- re-pin it with --find."
+                )
+        self._ensure_place_page(page, target)
 
     def _dismiss_consent(self, page: Any) -> None:
         """Click through the EU/consent interstitial if Google shows one."""
@@ -419,8 +753,8 @@ class GoogleMapsReviewScraper:
             except Exception:
                 continue
 
-    def _ensure_place_page(self, page: Any) -> None:
-        """A search can land on a result list; open the first hit if so."""
+    def _ensure_place_page(self, page: Any, target: Target) -> None:
+        """A text search can land on a result list; open the first hit if so."""
         try:
             page.wait_for_selector('h1.DUwDvf, div[role="feed"] a[href*="/maps/place/"]')
         except Exception:
@@ -430,16 +764,26 @@ class GoogleMapsReviewScraper:
             return
 
         results = page.locator('div[role="feed"] a[href*="/maps/place/"]')
-        if results.count() > 0:
-            self.log("search returned a list; opening the first result")
-            results.first.click()
-            page.wait_for_selector("h1.DUwDvf")
-            page.wait_for_timeout(1500)
-        else:
+        count = results.count()
+        if count == 0:
             raise RuntimeError(
-                "Could not find a place page. Try passing an explicit --url, "
-                "or run with --no-headless to see what Google returned."
+                "Could not find a place page. Run with --no-headless to see what "
+                "Google returned, or pin the place with --find."
             )
+
+        if count > 1:
+            # The chain problem: several branches match, and picking the first is
+            # a guess. Say so loudly rather than letting a wrong branch through.
+            self.log(
+                f"WARNING: {count} places match {target.query!r}; taking the first. "
+                f"Pin the one you want with:  --find {target.query!r}"
+            )
+        else:
+            self.log("search returned a list; opening the only result")
+
+        results.first.click()
+        page.wait_for_selector("h1.DUwDvf")
+        page.wait_for_timeout(1500)
 
     def _read_place_details(self, page: Any) -> Place:
         raw = page.evaluate(JS_PLACE_DETAILS)
@@ -451,6 +795,7 @@ class GoogleMapsReviewScraper:
             category=raw.get("category", ""),
             phone=re.sub(r"^Phone:\s*", "", raw.get("phone", "")).strip(),
             website=raw.get("website", ""),
+            business_status=raw.get("business_status", "OPERATIONAL"),
         )
         self.log(f"place: {place.name or '(unknown)'} — {place.address or 'no address'}")
         return place
@@ -605,39 +950,74 @@ class GoogleMapsReviewScraper:
 # --------------------------------------------------------------------------- #
 # Places API backend
 # --------------------------------------------------------------------------- #
-def scrape_with_places_api(query: str, api_key: str, verbose: bool = True) -> Place:
-    """Official route. Returns at most five reviews -- that is an API limit."""
+PLACE_FIELDS = [
+    "id",
+    "displayName",
+    "formattedAddress",
+    "rating",
+    "userRatingCount",
+    "primaryTypeDisplayName",
+    "nationalPhoneNumber",
+    "websiteUri",
+    "googleMapsUri",
+    "businessStatus",
+    "reviews",
+]
+
+
+def _places_api_get(place_id: str, api_key: str) -> dict:
+    """Place Details -- the precise lookup when a Place ID is already pinned."""
     import requests
 
-    endpoint = "https://places.googleapis.com/v1/places:searchText"
-    fields = [
-        "places.id",
-        "places.displayName",
-        "places.formattedAddress",
-        "places.rating",
-        "places.userRatingCount",
-        "places.primaryTypeDisplayName",
-        "places.nationalPhoneNumber",
-        "places.websiteUri",
-        "places.googleMapsUri",
-        "places.reviews",
-    ]
+    response = requests.get(
+        f"https://places.googleapis.com/v1/places/{place_id}",
+        headers={
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": ",".join(PLACE_FIELDS),
+        },
+        params={"languageCode": "en"},
+        timeout=30,
+    )
+    if response.status_code == 404:
+        raise RuntimeError(
+            f"Places API does not recognise {place_id!r}. Place IDs are re-issued "
+            "when Google merges or relocates a listing -- re-pin it with --find."
+        )
+    response.raise_for_status()
+    return response.json()
+
+
+def _places_api_search(query: str, api_key: str, limit: int = 1) -> list[dict]:
+    """Text Search -- the fuzzy lookup used by --find."""
+    import requests
+
     response = requests.post(
-        endpoint,
+        "https://places.googleapis.com/v1/places:searchText",
         headers={
             "Content-Type": "application/json",
             "X-Goog-Api-Key": api_key,
-            "X-Goog-FieldMask": ",".join(fields),
+            "X-Goog-FieldMask": ",".join(f"places.{f}" for f in PLACE_FIELDS),
         },
-        json={"textQuery": query, "languageCode": "en", "maxResultCount": 1},
+        json={"textQuery": query, "languageCode": "en", "maxResultCount": limit},
         timeout=30,
     )
     response.raise_for_status()
-    places = response.json().get("places", [])
-    if not places:
-        raise RuntimeError(f"Places API returned no results for {query!r}")
+    return response.json().get("places", [])
 
-    raw = places[0]
+
+def scrape_with_places_api(
+    target: Target, api_key: str, verbose: bool = True, strict_verify: bool = True
+) -> Place:
+    """Official route. Returns at most five reviews -- that is an API limit."""
+    if target.place_id:
+        raw = _places_api_get(target.place_id, api_key)
+    else:
+        query = target.query or target.raw
+        results = _places_api_search(query, api_key, limit=1)
+        if not results:
+            raise RuntimeError(f"Places API returned no results for {query!r}")
+        raw = results[0]
+
     if verbose:
         print(f"[scraper] Places API matched: {raw.get('displayName', {}).get('text', '')}",
               file=sys.stderr)
@@ -651,7 +1031,22 @@ def scrape_with_places_api(query: str, api_key: str, verbose: bool = True) -> Pl
         phone=raw.get("nationalPhoneNumber", ""),
         website=raw.get("websiteUri", ""),
         url=raw.get("googleMapsUri", ""),
+        place_id=raw.get("id", target.place_id),
+        business_status=raw.get("businessStatus", "OPERATIONAL"),
     )
+    place.slug = target.slug or slugify(place.name)
+
+    # The API returns the canonical id, so a pinned id that has been superseded
+    # shows up here as a mismatch worth reporting.
+    if target.place_id and place.place_id and place.place_id != target.place_id:
+        print(
+            f"[scraper] NOTE: Google now calls this place {place.place_id!r}, "
+            f"not {target.place_id!r}. Update places.json.",
+            file=sys.stderr,
+        )
+
+    for problem in verify_place(place, target, strict=strict_verify):
+        print(f"[scraper] WARNING: {problem}", file=sys.stderr)
 
     for item in raw.get("reviews", []):
         published = item.get("publishTime", "")
@@ -669,6 +1064,57 @@ def scrape_with_places_api(query: str, api_key: str, verbose: bool = True) -> Pl
             )
         )
     return place
+
+
+def find_with_places_api(query: str, api_key: str, limit: int = 5) -> list[dict]:
+    """Candidate places with real Place IDs, straight from the official API."""
+    return [
+        {
+            "name": raw.get("displayName", {}).get("text", ""),
+            "address": raw.get("formattedAddress", ""),
+            "rating": raw.get("rating"),
+            "review_count": raw.get("userRatingCount"),
+            "place_id": raw.get("id", ""),
+            "url": raw.get("googleMapsUri", ""),
+            "business_status": raw.get("businessStatus", "OPERATIONAL"),
+        }
+        for raw in _places_api_search(query, api_key, limit=limit)
+    ]
+
+
+def print_candidates(candidates: list[dict], query: str) -> None:
+    """Print --find results as records ready to paste into places.json."""
+    if not candidates:
+        print(f"No places matched {query!r}.")
+        return
+
+    print(f"\n{len(candidates)} match(es) for {query!r}:\n")
+    for i, candidate in enumerate(candidates, 1):
+        rating = candidate.get("rating")
+        count = candidate.get("review_count")
+        summary = f"{rating} ({count} ratings)" if rating else "no rating"
+        status = candidate.get("business_status", "OPERATIONAL")
+        flag = "" if status == "OPERATIONAL" else f"  [{status}]"
+        print(f"  {i}. {candidate['name']} — {candidate['address']}")
+        print(f"     {summary}{flag}")
+        if not candidate.get("place_id"):
+            print("     place_id: (not found — open the URL and copy it manually)")
+            print(f"     {candidate.get('url', '')}")
+        print()
+
+    print("Paste the one you want into places.json:\n")
+    best = candidates[0]
+    slug = slugify(f"{best['name']} {best['address'].split(',')[0]}")
+    record = {
+        slug: {
+            "place_id": best.get("place_id", ""),
+            "name": best.get("name", ""),
+            "address": best.get("address", ""),
+            "last_verified": date.today().isoformat(),
+        }
+    }
+    print(json.dumps(record, indent=2, ensure_ascii=False))
+    print()
 
 
 # --------------------------------------------------------------------------- #
@@ -718,6 +1164,10 @@ def print_summary(place: Place) -> None:
     print(f"  {place.name or 'Unknown place'}")
     if place.address:
         print(f"  {place.address}")
+    if place.place_id:
+        print(f"  Place ID: {place.place_id}" + ("  (verified)" if place.verified else ""))
+    if place.business_status != "OPERATIONAL":
+        print(f"  Status: {place.business_status}")
     if place.rating:
         total = f" from {place.review_count} ratings" if place.review_count else ""
         print(f"  Google rating: {place.rating}{total}")
@@ -751,14 +1201,25 @@ def print_summary(place: Place) -> None:
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Scrape Google reviews for Pizzaville in Liberty Village, Toronto.",
+        prog="scrape_google_reviews.py",
+        description="Scrape Google reviews for a restaurant, pinned by Place ID.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--query", default=DEFAULT_QUERY,
-                        help=f"Search text for Google Maps (default: {DEFAULT_QUERY!r})")
-    parser.add_argument("--url", default=None,
-                        help="Skip the search and scrape this Google Maps place URL directly")
+    parser.add_argument("target", nargs="?", default=None,
+                        help="A places.json slug (preferred), a Place ID, a Maps URL, "
+                             "or free text to search for")
+    parser.add_argument("--find", metavar="QUERY", default=None,
+                        help="Search for a place and print a pasteable places.json "
+                             "record instead of scraping")
+    parser.add_argument("--verify-registry", action="store_true",
+                        help="Re-resolve every registry entry and report drift")
+    parser.add_argument("--registry", default=DEFAULT_REGISTRY,
+                        help=f"Registry file (default: {DEFAULT_REGISTRY})")
+    parser.add_argument("--near", default=None, metavar="LAT,LNG",
+                        help="Bias a text search toward these coordinates")
+    parser.add_argument("--no-verify", dest="verify", action="store_false",
+                        help="Scrape even when the place no longer matches its record")
     parser.add_argument("--backend", choices=["playwright", "places-api"], default="playwright",
                         help="playwright scrapes all reviews; places-api is official but caps at 5")
     parser.add_argument("--api-key", default=os.environ.get("GOOGLE_MAPS_API_KEY"),
@@ -767,8 +1228,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Review sort order (default: newest)")
     parser.add_argument("--max-reviews", type=int, default=None,
                         help="Stop after roughly this many reviews")
-    parser.add_argument("--output", default="pizzaville_reviews.json",
-                        help="JSON output path (default: pizzaville_reviews.json)")
+    parser.add_argument("--output", default=None,
+                        help="JSON output path (default: reviews_<slug>.json)")
     parser.add_argument("--csv", default=None, help="Also write a CSV to this path")
     parser.add_argument("--no-headless", dest="headless", action="store_false",
                         help="Show the browser window (useful for debugging)")
@@ -783,27 +1244,114 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _make_scraper(args) -> GoogleMapsReviewScraper:
+    return GoogleMapsReviewScraper(
+        headless=args.headless,
+        max_reviews=args.max_reviews,
+        sort=args.sort,
+        timeout=args.timeout * 1000,
+        scroll_pause=args.scroll_pause,
+        verbose=not args.quiet,
+        browser_path=args.browser_path,
+    )
+
+
+def run_find(args) -> int:
+    if args.api_key:
+        candidates = find_with_places_api(args.find, args.api_key)
+    else:
+        candidates = _make_scraper(args).find(args.find, near=args.near)
+    print_candidates(candidates, args.find)
+    return 0 if candidates else 1
+
+
+def run_verify_registry(args) -> int:
+    registry = load_registry(args.registry)
+    if not registry:
+        print(f"{args.registry} is empty or missing — nothing to verify.")
+        return 1
+
+    scraper = None if args.api_key else _make_scraper(args)
+    drifted = 0
+
+    for slug in registry:
+        target = resolve_target(slug, registry)
+        try:
+            if args.api_key:
+                raw = _places_api_get(target.place_id, args.api_key)
+                place = Place(
+                    name=raw.get("displayName", {}).get("text", ""),
+                    address=raw.get("formattedAddress", ""),
+                    place_id=raw.get("id", ""),
+                    business_status=raw.get("businessStatus", "OPERATIONAL"),
+                )
+            else:
+                with scraper._page() as page:
+                    scraper._goto_place(page, target)
+                    place = scraper._read_place_details(page)
+                    place.place_id = scraper._read_place_id(page)
+
+            problems = verify_place(place, target, strict=False)
+            if problems:
+                drifted += 1
+                print(f"  DRIFT  {slug}")
+                for problem in problems:
+                    print(f"         {problem}")
+            else:
+                print(f"  ok     {slug} — {place.name}, {place.address}")
+        except Exception as exc:
+            drifted += 1
+            print(f"  FAIL   {slug}: {exc}")
+
+    print(f"\n{len(registry)} entries checked, {drifted} needing attention.")
+    return 1 if drifted else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    if args.find and args.verify_registry:
+        print("Use --find or --verify-registry, not both.", file=sys.stderr)
+        return 2
+    if args.backend == "places-api" and not args.api_key:
+        print("--backend places-api needs --api-key or GOOGLE_MAPS_API_KEY", file=sys.stderr)
+        return 2
+
     try:
-        if args.backend == "places-api":
-            if not args.api_key:
-                print("--backend places-api needs --api-key or GOOGLE_MAPS_API_KEY",
-                      file=sys.stderr)
-                return 2
-            place = scrape_with_places_api(args.query, args.api_key, verbose=not args.quiet)
-        else:
-            scraper = GoogleMapsReviewScraper(
-                headless=args.headless,
-                max_reviews=args.max_reviews,
-                sort=args.sort,
-                timeout=args.timeout * 1000,
-                scroll_pause=args.scroll_pause,
-                verbose=not args.quiet,
-                browser_path=args.browser_path,
+        if args.find:
+            return run_find(args)
+        if args.verify_registry:
+            return run_verify_registry(args)
+
+        if not args.target:
+            registry = load_registry(args.registry)
+            known = ", ".join(sorted(registry)) if registry else "(registry is empty)"
+            print(
+                "No target given.\n\n"
+                f"  Registered places: {known}\n\n"
+                "  Scrape one:   scrape_google_reviews.py <slug>\n"
+                "  Add one:      scrape_google_reviews.py --find \"Name, City\"",
+                file=sys.stderr,
             )
-            place = scraper.scrape(query=args.query, url=args.url)
+            return 2
+
+        registry = load_registry(args.registry)
+        target = resolve_target(args.target, registry, near=args.near)
+
+        if target.kind == "query" and not args.quiet:
+            print(
+                f"[scraper] NOTE: {args.target!r} is not in {args.registry}, so it is "
+                "being treated as a text search. Chains have many branches — pin the "
+                f"one you want with:  --find {args.target!r}",
+                file=sys.stderr,
+            )
+
+        if args.backend == "places-api":
+            place = scrape_with_places_api(
+                target, args.api_key, verbose=not args.quiet, strict_verify=args.verify
+            )
+        else:
+            place = _make_scraper(args).scrape(target, strict_verify=args.verify)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         return 130
@@ -815,7 +1363,8 @@ def main(argv: list[str] | None = None) -> int:
         print("No reviews found. Re-run with --no-headless to see what the page showed.",
               file=sys.stderr)
 
-    write_json(place, args.output)
+    output = args.output or f"reviews_{place.slug or 'place'}.json"
+    write_json(place, output)
     if args.csv:
         write_csv(place.reviews, args.csv)
     if not args.quiet:

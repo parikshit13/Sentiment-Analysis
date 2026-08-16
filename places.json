@@ -1,0 +1,9 @@
+{
+  "pizzaville-liberty-village": {
+    "place_id": "REPLACE_ME",
+    "name": "Pizzaville",
+    "address": "60 Atlantic Ave, Toronto, ON",
+    "last_verified": "",
+    "notes": "Placeholder. Run: python scrape_google_reviews.py --find \"Pizzaville Liberty Village Toronto\" and paste the real record over this one. name and address are checked on every scrape, so keep them accurate."
+  }
+}

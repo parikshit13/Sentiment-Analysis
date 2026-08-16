@@ -6,5 +6,5 @@ venv/
 .pytest_cache/
 
 # Scraper output
-pizzaville_reviews.json
+reviews_*.json
 *.csv
